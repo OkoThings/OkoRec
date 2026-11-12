@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=OkoRec
+Comment=Screen recorder with instant replay
+Exec=okorec
+Icon=media-record
+Terminal=false
+Categories=AudioVideo;Recorder;

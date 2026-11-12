@@ -1,0 +1,5 @@
+.zig-cache/
+zig-out/
+zig-pkg/
+# Local X11 development files (`zig build fetch-x11`)
+third_party/

@@ -1,0 +1,51 @@
+# Maintainer: Jules Lagarde
+pkgname=okorec-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="GPU screen recorder with an instant-replay buffer (NVIDIA, KMS capture)"
+arch=('x86_64')
+url="https://github.com/OkoThings/okorec"
+license=('MIT')
+depends=('glibc' 'libpipewire' 'opus' 'libx11' 'libglvnd' 'libxrandr' 'libxinerama' 'libxcursor' 'libxi' 'nvidia-utils')
+makedepends=('git')
+optdepends=('pipewire: pw-play for the feedback sounds'
+            'sound-theme-freedesktop: feedback sounds'
+            'ttf-dejavu: window font'
+            'xdg-desktop-portal: capture with --portal instead of the KMS helper')
+provides=('okorec')
+conflicts=('okorec')
+install=okorec.install
+# Built with the Zig release it was written for: raylib 6.0's build script does
+# not work with newer compilers.
+_zig=zig-x86_64-linux-0.16.0
+source=("git+$url.git"
+        "https://ziglang.org/download/0.16.0/$_zig.tar.xz")
+sha256sums=('SKIP'
+            '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00')
+
+pkgver() {
+  cd okorec
+  printf '0.1.0.r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd okorec
+  # Download raylib here, so build() runs without network access.
+  ZIG_GLOBAL_CACHE_DIR="$srcdir/zig-cache" "$srcdir/$_zig/zig" build --fetch
+}
+
+build() {
+  cd okorec
+  ZIG_GLOBAL_CACHE_DIR="$srcdir/zig-cache" "$srcdir/$_zig/zig" build \
+    -Doptimize=ReleaseSafe -Dcpu=baseline -Dsystem-libs --prefix "$srcdir/stage"
+}
+
+package() {
+  cd okorec
+  install -Dm755 "$srcdir/stage/bin/okorec" "$pkgdir/usr/bin/okorec"
+  install -Dm755 "$srcdir/stage/bin/okorec-kms" "$pkgdir/usr/bin/okorec-kms"
+  install -Dm644 "$srcdir/stage/share/applications/okorec.desktop" "$pkgdir/usr/share/applications/okorec.desktop"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 THIRD_PARTY.md "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY.md"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}
