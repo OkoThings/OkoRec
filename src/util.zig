@@ -95,11 +95,20 @@ pub const log = std.debug.print;
 
 /// Path of a small persistent file in $XDG_STATE_HOME/okorec (created on demand).
 pub fn statePath(buf: []u8, name: []const u8) ?[:0]u8 {
+    return xdgPath(buf, "XDG_STATE_HOME", ".local/state", name);
+}
+
+/// Path of a file in $XDG_CONFIG_HOME/okorec (created on demand).
+pub fn configPath(buf: []u8, name: []const u8) ?[:0]u8 {
+    return xdgPath(buf, "XDG_CONFIG_HOME", ".config", name);
+}
+
+fn xdgPath(buf: []u8, comptime var_name: [:0]const u8, comptime home_sub: []const u8, name: []const u8) ?[:0]u8 {
     var dir_buf: [400]u8 = undefined;
-    const dir = if (env("XDG_STATE_HOME")) |d|
+    const dir = if (env(var_name)) |d|
         std.fmt.bufPrint(&dir_buf, "{s}/okorec", .{d}) catch return null
     else if (env("HOME")) |h|
-        std.fmt.bufPrint(&dir_buf, "{s}/.local/state/okorec", .{h}) catch return null
+        std.fmt.bufPrint(&dir_buf, "{s}/" ++ home_sub ++ "/okorec", .{h}) catch return null
     else
         return null;
     mkdirAll(dir);

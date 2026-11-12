@@ -1,10 +1,13 @@
-//! Desktop audio: captures what the default output device is playing
-//! (PipeWire sink monitor), encodes it to Opus in 20 ms frames and pushes
-//! the packets into the replay ring as track 1. Runs on its own thread.
+//! Audio capture through PipeWire, encoded to Opus in 20 ms frames and
+//! pushed into the replay ring. Two instances exist: desktop audio (the
+//! default output's monitor, ring track 1, always on) and the microphone
+//! (default input, ring track 2), which the user switches on and off.
+//! Each runs on its own thread.
 const std = @import("std");
 const c = @import("c.zig").c;
 const pod = @import("pod.zig");
 const Ring = @import("ring.zig").Ring;
+const mkv = @import("mkv.zig");
 const util = @import("util.zig");
 
 extern fn opus_encoder_create(fs: i32, channels: c_int, application: c_int, err: *c_int) ?*anyopaque;
@@ -12,16 +15,23 @@ extern fn opus_encode_float(st: ?*anyopaque, pcm: [*]const f32, frame_size: c_in
 extern fn opus_encoder_ctl(st: ?*anyopaque, request: c_int, ...) c_int;
 
 const rate = 48000;
-const channels = 2;
 /// Samples per channel in one Opus frame (20 ms).
 const frame = 960;
+
+pub const Source = enum { desktop, mic };
 
 pub const Audio = struct {
     gpa: std.mem.Allocator,
     ring: *Ring,
-    bitrate: i32 = 160_000,
+    source: Source = .desktop,
 
-    loop: std.atomic.Value(?*c.pw_main_loop) = .init(null),
+    /// Mic only: whether the stream should be open. The thread opens and
+    /// closes it to follow this, so the system shows the mic as in use only
+    /// while it is switched on.
+    enabled: std.atomic.Value(bool) = .init(true),
+    /// Guards `loop` against being destroyed while another thread quits it.
+    loop_mutex: util.Mutex = .{},
+    loop: ?*c.pw_main_loop = null,
     stream: ?*c.pw_stream = null,
     hook: c.spa_hook = std.mem.zeroes(c.spa_hook),
     events: c.pw_stream_events = std.mem.zeroes(c.pw_stream_events),
@@ -32,7 +42,7 @@ pub const Audio = struct {
     head: [19]u8 = undefined,
     /// True once the encoder exists and `head` is valid.
     ready: std.atomic.Value(bool) = .init(false),
-    fifo: [frame * channels * 2]f32 = undefined,
+    fifo: [frame * 2 * 2]f32 = undefined,
     fifo_len: usize = 0,
     /// Capture time of the first sample since the last (re)start, and how
     /// many samples have arrived / been encoded since then.
@@ -42,41 +52,122 @@ pub const Audio = struct {
     /// Recent peak level (0..1), for the UI meter.
     peak: std.atomic.Value(f32) = .init(0),
 
-    /// Blocks until `quit`.
-    pub fn run(self: *Audio) !void {
+    fn channelCount(self: *const Audio) u32 {
+        return if (self.source == .mic) 1 else 2;
+    }
+
+    /// Ring track the packets go to.
+    pub fn track(self: *const Audio) u8 {
+        return if (self.source == .mic) 2 else 1;
+    }
+
+    /// The MKV track description, once the encoder exists.
+    pub fn trackInfo(self: *const Audio) ?mkv.AudioTrack {
+        if (!self.ready.load(.acquire)) return null;
+        return .{ .track = self.track(), .head = &self.head, .name = if (self.source == .mic) "Microphone" else "Desktop" };
+    }
+
+    fn initEncoder(self: *Audio) !void {
         var err: c_int = 0;
-        self.enc = opus_encoder_create(rate, channels, 2049, &err) orelse return error.OpusInitFailed; // APPLICATION_AUDIO
-        _ = opus_encoder_ctl(self.enc, 4002, self.bitrate); // SET_BITRATE
+        const ch = self.channelCount();
+        // Voice gets the speech-tuned mode (VOIP), the desktop the music one.
+        const app: c_int = if (self.source == .mic) 2048 else 2049;
+        self.enc = opus_encoder_create(rate, @intCast(ch), app, &err) orelse return error.OpusInitFailed;
+        _ = opus_encoder_ctl(self.enc, 4002, @as(i32, if (self.source == .mic) 64_000 else 160_000)); // SET_BITRATE
         var lookahead: i32 = 0;
         _ = opus_encoder_ctl(self.enc, 4027, &lookahead); // GET_LOOKAHEAD
         @memcpy(self.head[0..8], "OpusHead");
         self.head[8] = 1;
-        self.head[9] = channels;
+        self.head[9] = @intCast(ch);
         std.mem.writeInt(u16, self.head[10..12], @intCast(lookahead), .little);
         std.mem.writeInt(u32, self.head[12..16], rate, .little);
         std.mem.writeInt(u16, self.head[16..18], 0, .little);
         self.head[18] = 0;
         self.ready.store(true, .release);
+    }
 
+    /// Desktop audio: blocks until `quit`.
+    pub fn run(self: *Audio) !void {
+        try self.initEncoder();
         @import("c.zig").pw_init(null, null);
+        try self.session();
+    }
+
+    /// Microphone: never returns; opens the stream while `enabled` is set.
+    pub fn serve(self: *Audio) void {
+        self.initEncoder() catch |e| {
+            util.log("microphone unavailable: {s}\n", .{@errorName(e)});
+            return;
+        };
+        @import("c.zig").pw_init(null, null);
+        while (true) {
+            if (!self.enabled.load(.acquire)) {
+                const ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+                _ = std.os.linux.nanosleep(&ts, null);
+                continue;
+            }
+            _ = opus_encoder_ctl(self.enc, 4028); // RESET_STATE
+            self.anchor_ns = 0;
+            self.session() catch |e| {
+                util.log("microphone: {s}\n", .{@errorName(e)});
+                const ts: std.os.linux.timespec = .{ .sec = 2, .nsec = 0 };
+                _ = std.os.linux.nanosleep(&ts, null);
+            };
+            self.peak.store(0, .monotonic);
+        }
+    }
+
+    /// Switches the microphone stream on or off.
+    pub fn setEnabled(self: *Audio, on: bool) void {
+        self.enabled.store(on, .release);
+        if (!on) self.quit();
+    }
+
+    /// One PipeWire connection, torn down when its loop is quit.
+    fn session(self: *Audio) !void {
         const loop = c.pw_main_loop_new(null) orelse return error.PipeWireLoop;
+        defer {
+            self.loop_mutex.lock();
+            self.loop = null;
+            self.loop_mutex.unlock();
+            c.pw_main_loop_destroy(loop);
+        }
         const ctx = c.pw_context_new(c.pw_main_loop_get_loop(loop), null, 0) orelse return error.PipeWireContext;
+        defer c.pw_context_destroy(ctx);
         const core = c.pw_context_connect(ctx, null, 0) orelse return error.PipeWireConnect;
-        const props = c.pw_properties_new(
-            c.PW_KEY_MEDIA_TYPE,
-            "Audio",
-            c.PW_KEY_MEDIA_CATEGORY,
-            "Capture",
-            c.PW_KEY_MEDIA_ROLE,
-            "Music",
-            c.PW_KEY_STREAM_CAPTURE_SINK,
-            "true",
-            @as(?[*:0]const u8, null),
-        );
-        self.stream = c.pw_stream_new(core, "okorec audio", props) orelse return error.PipeWireStream;
+        defer _ = c.pw_core_disconnect(core);
+        const props = if (self.source == .mic)
+            c.pw_properties_new(
+                c.PW_KEY_MEDIA_TYPE,
+                "Audio",
+                c.PW_KEY_MEDIA_CATEGORY,
+                "Capture",
+                c.PW_KEY_MEDIA_ROLE,
+                "Communication",
+                @as(?[*:0]const u8, null),
+            )
+        else
+            c.pw_properties_new(
+                c.PW_KEY_MEDIA_TYPE,
+                "Audio",
+                c.PW_KEY_MEDIA_CATEGORY,
+                "Capture",
+                c.PW_KEY_MEDIA_ROLE,
+                "Music",
+                c.PW_KEY_STREAM_CAPTURE_SINK,
+                "true",
+                @as(?[*:0]const u8, null),
+            );
+        const stream = c.pw_stream_new(core, if (self.source == .mic) "okorec microphone" else "okorec audio", props) orelse return error.PipeWireStream;
+        self.stream = stream;
+        defer {
+            c.pw_stream_destroy(stream);
+            self.stream = null;
+        }
+        self.hook = std.mem.zeroes(c.spa_hook);
         self.events.version = c.PW_VERSION_STREAM_EVENTS;
         self.events.process = onProcess;
-        c.pw_stream_add_listener(self.stream, &self.hook, &self.events, self);
+        c.pw_stream_add_listener(stream, &self.hook, &self.events, self);
 
         var b = pod.Builder{ .buf = &self.pod_buf };
         const o = b.object(c.SPA_TYPE_OBJECT_Format, c.SPA_PARAM_EnumFormat);
@@ -89,20 +180,26 @@ pub const Audio = struct {
         b.prop(c.SPA_FORMAT_AUDIO_rate, 0);
         b.int(rate);
         b.prop(c.SPA_FORMAT_AUDIO_channels, 0);
-        b.int(channels);
+        b.int(@intCast(self.channelCount()));
         b.prop(c.SPA_FORMAT_AUDIO_position, 0);
-        b.idArray(&.{ c.SPA_AUDIO_CHANNEL_FL, c.SPA_AUDIO_CHANNEL_FR });
+        if (self.source == .mic) b.idArray(&.{c.SPA_AUDIO_CHANNEL_MONO}) else b.idArray(&.{ c.SPA_AUDIO_CHANNEL_FL, c.SPA_AUDIO_CHANNEL_FR });
         b.end(o);
         var params = [_][*c]const c.struct_spa_pod{@ptrCast(@alignCast(b.ptr(o)))};
-        if (c.pw_stream_connect(self.stream, c.PW_DIRECTION_INPUT, 0xffffffff, c.PW_STREAM_FLAG_AUTOCONNECT | c.PW_STREAM_FLAG_MAP_BUFFERS, &params, params.len) < 0)
+        if (c.pw_stream_connect(stream, c.PW_DIRECTION_INPUT, 0xffffffff, c.PW_STREAM_FLAG_AUTOCONNECT | c.PW_STREAM_FLAG_MAP_BUFFERS, &params, params.len) < 0)
             return error.PipeWireStreamConnect;
 
-        self.loop.store(loop, .release);
+        self.loop_mutex.lock();
+        self.loop = loop;
+        self.loop_mutex.unlock();
+        // Switched off while connecting.
+        if (self.source == .mic and !self.enabled.load(.acquire)) return;
         _ = c.pw_main_loop_run(loop);
     }
 
     pub fn quit(self: *Audio) void {
-        if (self.loop.load(.acquire)) |loop| _ = c.pw_main_loop_quit(loop);
+        self.loop_mutex.lock();
+        defer self.loop_mutex.unlock();
+        if (self.loop) |loop| _ = c.pw_main_loop_quit(loop);
     }
 
     fn onProcess(data: ?*anyopaque) callconv(.c) void {
@@ -127,6 +224,7 @@ pub const Audio = struct {
 
     /// Takes interleaved stereo samples that have just arrived.
     fn feed(self: *Audio, samples: []const f32) !void {
+        const channels = self.channelCount();
         const frames_in = samples.len / channels;
         if (frames_in == 0) return;
         var peak: f32 = 0;
@@ -158,7 +256,7 @@ pub const Audio = struct {
                 if (len < 0) return error.OpusEncodeFailed;
                 const pts = self.anchor_ns + nsOf(self.encoded);
                 self.encoded += frame;
-                try self.ring.push(try self.gpa.dupe(u8, out[0..@intCast(len)]), pts, false, 1);
+                try self.ring.push(try self.gpa.dupe(u8, out[0..@intCast(len)]), pts, false, self.track());
             }
             std.mem.copyForwards(f32, self.fifo[0 .. self.fifo_len - off], self.fifo[off..self.fifo_len]);
             self.fifo_len -= off;

@@ -22,6 +22,7 @@ const Pipeline = @import("pipeline.zig").Pipeline;
 const Capture = @import("capture.zig").Capture;
 const KmsCapture = @import("kms_capture.zig").KmsCapture;
 const Audio = @import("audio.zig").Audio;
+const settings = @import("settings.zig");
 const Recorder = @import("record.zig").Recorder;
 
 const gpa = std.heap.c_allocator;
@@ -40,6 +41,8 @@ pub const Config = struct {
     hdr: ?egl.Transfer = null,
     sdr_white: f32 = 203,
     audio: bool = true,
+    /// Microphone track: null = as last switched in the window.
+    mic: ?bool = null,
     /// Play a short sound when a clip is saved or a recording starts/stops.
     sound: bool = true,
     headless: bool = false,
@@ -53,7 +56,15 @@ pub const App = struct {
     pipe: *Pipeline,
     kms: ?*KmsCapture = null,
     audio: ?*Audio = null,
+    mic: ?*Audio = null,
     recorder: Recorder,
+    portal_cap: ?*Capture = null,
+    session: ?portal.Session = null,
+    pid_path: [:0]const u8 = "",
+    /// Serialises the actions below: they come from both the window and the
+    /// signal thread.
+    mutex: util.Mutex = .{},
+    stopping: std.atomic.Value(bool) = .init(false),
     /// Last thing that happened, shown in the window.
     message_buf: [700]u8 = undefined,
     message_len: usize = 0,
@@ -80,9 +91,20 @@ pub const App = struct {
         return std.fmt.bufPrintZ(buf, "{s}/{s}-{s}.mkv", .{ self.cfg.dir, kind, stamp[0..n] });
     }
 
-    fn opusHead(self: *App) ?[]const u8 {
-        const a = self.audio orelse return null;
-        return if (a.ready.load(.acquire)) &a.head else null;
+    pub fn micOn(self: *const App) bool {
+        const m = self.mic orelse return false;
+        return m.enabled.load(.acquire);
+    }
+
+    /// Switches the microphone and remembers the choice for next time.
+    pub fn setMic(self: *App, on: bool) void {
+        const m = self.mic orelse return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (m.enabled.load(.acquire) == on) return;
+        m.setEnabled(on);
+        self.say("Microphone {s}", .{if (on) "on" else "off"});
+        settings.set("mic", if (on) "on" else "off");
     }
 
     fn cue(self: *App, which: sound.Cue) void {
@@ -95,6 +117,8 @@ pub const App = struct {
 
     /// Changes the capture rate on the fly and remembers it for next time.
     pub fn setFps(self: *App, value: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (value == self.fps()) return;
         self.pipe.fps.store(value, .monotonic);
         self.say("Capturing at {d} fps", .{value});
@@ -102,6 +126,8 @@ pub const App = struct {
     }
 
     pub fn saveReplay(self: *App) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.writeReplay() catch |e| {
             self.cue(.failed);
             self.say("Replay not saved: {s}", .{@errorName(e)});
@@ -121,7 +147,23 @@ pub const App = struct {
 
         var path_buf: [600]u8 = undefined;
         const path = try self.clipPath(&path_buf, "replay");
-        var mux = try mkv.Muxer.begin(gpa, path, .{ .width = self.pipe.width, .height = self.pipe.height, .fps = self.fps() }, packets[0], self.opusHead());
+        // The mic track is included when the clip holds any mic audio.
+        var tracks: [2]mkv.AudioTrack = undefined;
+        var n: usize = 0;
+        if (self.audio) |a| if (a.trackInfo()) |t| {
+            tracks[n] = t;
+            n += 1;
+        };
+        if (self.mic) |a| if (a.trackInfo()) |t| {
+            for (packets) |p| {
+                if (p.track == t.track) {
+                    tracks[n] = t;
+                    n += 1;
+                    break;
+                }
+            }
+        };
+        var mux = try mkv.Muxer.begin(gpa, path, .{ .width = self.pipe.width, .height = self.pipe.height, .fps = self.fps() }, packets[0], tracks[0..n]);
         try mux.writeGops(packets);
         const bytes = mux.pos;
         try mux.finish();
@@ -139,6 +181,8 @@ pub const App = struct {
     }
 
     pub fn toggleRecording(self: *App) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.recorder.active.load(.acquire)) {
             self.recorder.stop();
             self.cue(.saved);
@@ -171,6 +215,7 @@ pub const App = struct {
         }
         if (info.signo == @intFromEnum(linux.SIG.HUP)) {
             if (storedFps()) |v| self.setFps(v);
+            if (self.mic != null) self.setMic(storedMic());
             return .none;
         }
         if (info.signo == @intFromEnum(linux.SIG.USR2)) {
@@ -179,25 +224,63 @@ pub const App = struct {
         }
         return .quit;
     }
+
+    /// Finalises an active recording, stops capture and exits the process.
+    /// Called by whichever comes first: the window closing or a quit signal.
+    pub fn shutdown(self: *App) noreturn {
+        if (self.stopping.swap(true, .acq_rel)) {
+            // The other path is already at it.
+            while (true) {
+                const ts: linux.timespec = .{ .sec = 1, .nsec = 0 };
+                _ = linux.nanosleep(&ts, null);
+            }
+        }
+        self.recorder.stop();
+        var waited: u32 = 0;
+        while (self.recorder.busy.load(.acquire) and waited < 50) : (waited += 1) {
+            const ts: linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+            _ = linux.nanosleep(&ts, null);
+        }
+        if (self.portal_cap) |cap| cap.quit();
+        if (self.kms) |cap| cap.quit();
+        if (self.audio) |a| a.quit();
+        if (self.mic) |a| a.setEnabled(false);
+        _ = linux.unlink(self.pid_path);
+        if (self.session) |*s| s.close();
+        if (capture_failed.load(.acquire)) {
+            util.log("okorec: CaptureFailed\n", .{});
+            linux.exit_group(1);
+        }
+        // NVIDIA's libraries can hang in their exit handlers; skip them.
+        linux.exit_group(0);
+    }
 };
+
+/// Signals are handled here rather than in the window loop, which stalls
+/// while the window is minimised (the driver blocks in buffer swap).
+fn signalThread(app: *App, sfd: i32) void {
+    while (app.handleSignal(sfd) != .quit) {}
+    app.shutdown();
+}
 
 /// The capture rate last chosen in the window or with `okorec fps`.
 fn storedFps() ?u32 {
-    var pbuf: [512]u8 = undefined;
-    var fbuf: [16]u8 = undefined;
-    const text = util.readFile(util.statePath(&pbuf, "fps") orelse return null, &fbuf) orelse return null;
-    const v = std.fmt.parseInt(u32, std.mem.trim(u8, text, " \n"), 10) catch return null;
+    var vbuf: [16]u8 = undefined;
+    const v = std.fmt.parseInt(u32, settings.get("fps", &vbuf) orelse return null, 10) catch return null;
     return if (v > 0 and v <= 480) v else null;
 }
 
 fn storeFps(value: u32) void {
-    var pbuf: [512]u8 = undefined;
     var nbuf: [16]u8 = undefined;
-    const p = util.statePath(&pbuf, "fps") orelse return;
-    util.writeFile(p, std.fmt.bufPrint(&nbuf, "{d}\n", .{value}) catch return) catch {};
+    settings.set("fps", std.fmt.bufPrint(&nbuf, "{d}", .{value}) catch return);
 }
 
-/// `okorec fps N`: remember the rate and tell a running instance, if any.
+/// Whether the microphone was on when last switched in the window.
+fn storedMic() bool {
+    var vbuf: [16]u8 = undefined;
+    return std.mem.eql(u8, settings.get("mic", &vbuf) orelse return false, "on");
+}
+
 fn changeFps(value: u32) !void {
     storeFps(value);
     signalRunning(.HUP) catch util.log("okorec: not running; {d} fps will be used at the next start\n", .{value});
@@ -217,6 +300,8 @@ fn findHelper(buf: []u8) ![:0]u8 {
     }
     return std.fmt.bufPrintZ(buf, "{s}/.local/bin/okorec-kms", .{util.env("HOME") orelse ""});
 }
+
+var pid_path_buf: [256]u8 = undefined;
 
 fn pidPath(buf: []u8) [:0]u8 {
     const dir = util.env("XDG_RUNTIME_DIR") orelse "/tmp";
@@ -286,12 +371,12 @@ fn audioThread(audio: *Audio) void {
 }
 
 fn run(cfg: Config) !void {
-    // Signals are handled synchronously through a signalfd on this thread;
+    // Signals are read from a signalfd by a dedicated thread (signalThread);
     // block them before any other thread exists.
     var set = linux.sigemptyset();
     for ([_]linux.SIG{ .INT, .TERM, .HUP, .USR1, .USR2 }) |sig| linux.sigaddset(&set, sig);
     _ = linux.sigprocmask(linux.SIG.BLOCK, &set, null);
-    const sfd: i32 = @intCast(linux.signalfd(-1, &set, linux.SFD.CLOEXEC | @as(u32, if (cfg.headless) 0 else linux.SFD.NONBLOCK)));
+    const sfd: i32 = @intCast(linux.signalfd(-1, &set, linux.SFD.CLOEXEC));
 
     // One instance per session: `okorec save` and the shortcuts address it
     // through the pidfile.
@@ -313,16 +398,14 @@ fn run(cfg: Config) !void {
     };
     pipe.* = .{ .gpa = gpa, .opt = .{ .cq = cfg.cq, .debug = cfg.debug }, .ring = &app.ring, .fps = .init(cfg.fps) };
 
-    var session: ?portal.Session = null;
-    var portal_cap: ?*Capture = null;
     var helper_buf: [512]u8 = undefined;
     switch (cfg.source) {
         .portal => {
-            session = try portal.open();
+            app.session = try portal.open();
             const cap = try gpa.create(Capture);
             cap.* = .{ .pipe = pipe, .zero_copy = cfg.zero_copy };
-            portal_cap = cap;
-            (try std.Thread.spawn(.{}, portalThread, .{ cap, session.?.pw_fd, session.?.node_id })).detach();
+            app.portal_cap = cap;
+            (try std.Thread.spawn(.{}, portalThread, .{ cap, app.session.?.pw_fd, app.session.?.node_id })).detach();
         },
         .kms => {
             const helper = try findHelper(&helper_buf);
@@ -339,32 +422,26 @@ fn run(cfg: Config) !void {
         app.recorder.audio = audio;
         (try std.Thread.spawn(.{}, audioThread, .{audio})).detach();
     }
+    {
+        const mic = try gpa.create(Audio);
+        mic.* = .{ .gpa = gpa, .ring = &app.ring, .source = .mic, .enabled = .init(cfg.mic orelse storedMic()) };
+        app.mic = mic;
+        app.recorder.mic = mic;
+        (try std.Thread.spawn(.{}, Audio.serve, .{mic})).detach();
+    }
 
-    var pbuf: [256]u8 = undefined;
     var nbuf: [16]u8 = undefined;
-    const pid_path = pidPath(&pbuf);
-    try util.writeFile(pid_path, try std.fmt.bufPrint(&nbuf, "{d}\n", .{linux.getpid()}));
+    app.pid_path = pidPath(&pid_path_buf);
+    try util.writeFile(app.pid_path, try std.fmt.bufPrint(&nbuf, "{d}\n", .{linux.getpid()}));
     util.log("okorec: keeping the last {d} s. `okorec save` saves a clip, `okorec record` toggles recording, Ctrl-C quits.\n", .{cfg.seconds});
 
     if (cfg.headless) {
-        while (app.handleSignal(sfd) != .quit) {}
+        signalThread(app, sfd);
     } else {
-        ui.run(app, sfd);
+        (try std.Thread.spawn(.{}, signalThread, .{ app, sfd })).detach();
+        ui.run(app);
+        app.shutdown();
     }
-
-    // Let an active recording finalise its file before we go.
-    app.recorder.stop();
-    var waited: u32 = 0;
-    while (app.recorder.busy.load(.acquire) and waited < 50) : (waited += 1) {
-        const ts: linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
-        _ = linux.nanosleep(&ts, null);
-    }
-    if (portal_cap) |cap| cap.quit();
-    if (app.kms) |cap| cap.quit();
-    if (app.audio) |a| a.quit();
-    _ = linux.unlink(pid_path);
-    if (session) |*s| s.close();
-    if (capture_failed.load(.acquire)) return error.CaptureFailed;
 }
 
 pub fn main(init: std.process.Init.Minimal) void {
@@ -406,6 +483,9 @@ pub fn main(init: std.process.Init.Minimal) void {
             cfg.sdr_white = std.fmt.parseFloat(f32, args.next() orelse "") catch usage();
         } else if (std.mem.eql(u8, a, "--no-audio")) {
             cfg.audio = false;
+        } else if (std.mem.eql(u8, a, "--mic")) {
+            const v = args.next() orelse usage();
+            cfg.mic = if (std.mem.eql(u8, v, "on")) true else if (std.mem.eql(u8, v, "off")) false else usage();
         } else if (std.mem.eql(u8, a, "--no-sound")) {
             cfg.sound = false;
         } else if (std.mem.eql(u8, a, "--headless")) {
@@ -416,6 +496,7 @@ pub fn main(init: std.process.Init.Minimal) void {
             cfg.dir = args.next() orelse usage();
         } else usage();
     }
+    settings.migrate();
     if (!cfg.fps_given) cfg.fps = storedFps() orelse cfg.fps;
     if (cfg.fps == 0 or cfg.fps > 480 or cfg.seconds == 0 or cfg.cq > 51) usage();
 
@@ -438,7 +519,7 @@ pub fn main(init: std.process.Init.Minimal) void {
 fn usage() noreturn {
     util.log(
         \\usage: okorec [--fps N] [--seconds N] [--cq 0-51] [--dir PATH]
-        \\            [--headless] [--no-audio] [--no-sound] [--debug]
+        \\            [--headless] [--no-audio] [--mic on|off] [--no-sound] [--debug]
         \\            [--hdr auto|on|off] [--sdr-white NITS]   KMS capture (default)
         \\            [--portal [--zero-copy]]                 capture through the desktop portal instead
         \\       okorec save      save the replay buffer of the running instance

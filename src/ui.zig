@@ -6,7 +6,7 @@ const util = @import("util.zig");
 const App = @import("main.zig").App;
 
 const width = 560;
-const height = 368;
+const height = 396;
 
 const bg = rl.Color{ .r = 18, .g = 20, .b = 24, .a = 255 };
 const panel = rl.Color{ .r = 30, .g = 33, .b = 40, .a = 255 };
@@ -54,16 +54,31 @@ fn chip(comptime fmt: []const u8, args: anytype, rect: rl.Rectangle, selected: b
     return hover and !selected and rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT);
 }
 
+/// On/off switch; returns true when clicked.
+fn toggle(rect: rl.Rectangle, on: bool) bool {
+    const hover = rl.CheckCollisionPointRec(rl.GetMousePosition(), rect);
+    rl.DrawRectangleRounded(rect, 0.4, 8, if (on) red else if (hover) panel_hi else panel);
+    text(mono, "{s}", .{if (on) " on" else "off"}, rect.x + 12, rect.y + 3, 16, if (on) fg else dim);
+    return hover and rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT);
+}
+
+fn meter(level: f32, x: f32, y: f32) void {
+    const l = std.math.clamp(level, 0, 1);
+    rl.DrawRectangleRounded(.{ .x = x, .y = y, .width = 110, .height = 8 }, 1, 4, panel);
+    if (l > 0.002) rl.DrawRectangleRounded(.{ .x = x, .y = y, .width = 110 * @sqrt(l), .height = 8 }, 1, 4, accent);
+}
+
 const fps_choices = [_]u32{ 30, 60, 120, 144, 240 };
 
 /// Per-second rates derived from the running counters.
 const Rates = struct {
     last_ns: i64 = 0,
     last_frames: u64 = 0,
-    last_bytes: [2]u64 = .{ 0, 0 },
+    last_bytes: [3]u64 = @splat(0),
     fps: f32 = 0,
     video_mbps: f32 = 0,
     audio_kbps: f32 = 0,
+    mic_kbps: f32 = 0,
     history: [120]f32 = @splat(0),
     head: usize = 0,
 
@@ -76,6 +91,7 @@ const Rates = struct {
             self.fps = @as(f32, @floatFromInt(frames - self.last_frames)) / dt;
             self.video_mbps = @as(f32, @floatFromInt(stats.total_bytes[0] - self.last_bytes[0])) * 8 / 1e6 / dt;
             self.audio_kbps = @as(f32, @floatFromInt(stats.total_bytes[1] - self.last_bytes[1])) * 8 / 1e3 / dt;
+            self.mic_kbps = @as(f32, @floatFromInt(stats.total_bytes[2] - self.last_bytes[2])) * 8 / 1e3 / dt;
             self.history[self.head] = self.video_mbps;
             self.head = (self.head + 1) % self.history.len;
         }
@@ -85,7 +101,7 @@ const Rates = struct {
     }
 };
 
-pub fn run(app: *App, sfd: i32) void {
+pub fn run(app: *App) void {
     rl.SetTraceLogLevel(rl.LOG_ERROR);
     rl.SetConfigFlags(rl.FLAG_MSAA_4X_HINT);
     rl.InitWindow(width, height, "OkoRec");
@@ -114,7 +130,6 @@ pub fn run(app: *App, sfd: i32) void {
     var focused = true;
     rl.SetTargetFPS(30);
     while (!rl.WindowShouldClose()) {
-        if (app.handleSignal(sfd) == .quit) break;
         // Nobody is looking: draw rarely, the recorder itself is unaffected.
         const now_focused = rl.IsWindowFocused();
         if (now_focused != focused) {
@@ -154,10 +169,19 @@ pub fn run(app: *App, sfd: i32) void {
         text(font, "Audio", .{}, 24, y0 + 52, 15, dim);
         if (app.audio) |a| {
             text(mono, "{d:.0} kb/s", .{rates.audio_kbps}, 100, y0 + 50, 17, fg);
-            const level = std.math.clamp(a.peak.load(.monotonic), 0, 1);
-            rl.DrawRectangleRounded(.{ .x = 200, .y = y0 + 56, .width = 110, .height = 8 }, 1, 4, panel);
-            if (level > 0.002) rl.DrawRectangleRounded(.{ .x = 200, .y = y0 + 56, .width = 110 * @sqrt(level), .height = 8 }, 1, 4, accent);
+            meter(a.peak.load(.monotonic), 200, y0 + 56);
         } else text(mono, "off", .{}, 100, y0 + 50, 17, dim);
+
+        // Microphone: switched here, remembered for next time.
+        text(font, "Mic", .{}, 24, y0 + 80, 15, dim);
+        if (app.mic) |m| {
+            const on = app.micOn();
+            if (toggle(.{ .x = 100, .y = y0 + 76, .width = 54, .height = 24 }, on)) app.setMic(!on);
+            if (on) {
+                text(mono, "{d:.0} kb/s", .{rates.mic_kbps}, 164, y0 + 78, 15, fg);
+                meter(m.peak.load(.monotonic), 250, y0 + 84);
+            }
+        }
 
         // Video bitrate over the last minute.
         const gx: f32 = 330;
@@ -176,35 +200,35 @@ pub fn run(app: *App, sfd: i32) void {
         text(font, "{d:.0} Mb/s", .{peak}, gx + 6, gy + 4, 12, dim);
 
         // Capture rate: applies immediately and is remembered.
-        text(font, "Rate", .{}, 24, 148, 15, dim);
+        text(font, "Rate", .{}, 24, 176, 15, dim);
         const current = app.fps();
         var custom = true;
         for (fps_choices, 0..) |f, i| {
             if (f == current) custom = false;
-            if (chip("{d: >3}", .{f}, .{ .x = 100 + 62 * @as(f32, @floatFromInt(i)), .y = 142, .width = 54, .height = 28 }, f == current))
+            if (chip("{d: >3}", .{f}, .{ .x = 100 + 62 * @as(f32, @floatFromInt(i)), .y = 170, .width = 54, .height = 28 }, f == current))
                 app.setFps(f);
         }
         // A rate from --fps that isn't one of the presets.
-        if (custom) _ = chip("{d: >3}", .{current}, .{ .x = 100 + 62 * fps_choices.len, .y = 142, .width = 54, .height = 28 }, true);
-        text(font, "fps", .{}, 100 + 62 * @as(f32, @floatFromInt(fps_choices.len + @intFromBool(custom))), 148, 15, dim);
+        if (custom) _ = chip("{d: >3}", .{current}, .{ .x = 100 + 62 * fps_choices.len, .y = 170, .width = 54, .height = 28 }, true);
+        text(font, "fps", .{}, 100 + 62 * @as(f32, @floatFromInt(fps_choices.len + @intFromBool(custom))), 176, 15, dim);
 
         // Actions.
-        if (button("Save replay", "Super+F10  -  last seconds to a file", .{ .x = 24, .y = 190, .width = 250, .height = 64 }, accent))
+        if (button("Save replay", "Super+F10  -  last seconds to a file", .{ .x = 24, .y = 218, .width = 250, .height = 64 }, accent))
             app.saveReplay();
         var rec_hint: [96]u8 = undefined;
         const hint: [:0]const u8 = if (recording) blk: {
             const secs: u64 = @intCast(@divTrunc(util.nowNs() - app.recorder.start_ns, std.time.ns_per_s));
             break :blk std.fmt.bufPrintZ(&rec_hint, "{d:0>2}:{d:0>2}   {d:.1} MB", .{ secs / 60, secs % 60, @as(f32, @floatFromInt(app.recorder.bytes.load(.monotonic))) / 1e6 }) catch "";
         } else "Super+F9  -  record until stopped";
-        if (button(if (recording) "Stop recording" else "Start recording", hint, .{ .x = 286, .y = 190, .width = 250, .height = 64 }, if (recording) red else dim))
+        if (button(if (recording) "Stop recording" else "Start recording", hint, .{ .x = 286, .y = 218, .width = 250, .height = 64 }, if (recording) red else dim))
             app.toggleRecording();
 
         // Last event, wrapped over two lines.
         const msg = app.message();
         if (msg.len > 0) {
             const split: usize = @min(msg.len, 74);
-            text(font, "{s}", .{msg[0..split]}, 24, 272, 14, dim);
-            if (msg.len > split) text(font, "{s}", .{msg[split..@min(msg.len, 2 * split)]}, 24, 290, 14, dim);
+            text(font, "{s}", .{msg[0..split]}, 24, 300, 14, dim);
+            if (msg.len > split) text(font, "{s}", .{msg[split..@min(msg.len, 2 * split)]}, 24, 318, 14, dim);
         }
         text(font, "Clips go to {s}", .{app.cfg.dir}, 24, height - 28, 13, dim);
 

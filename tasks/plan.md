@@ -41,7 +41,8 @@ Pipeline: portal ScreenCast (own D-Bus client) -> PipeWire stream -> GL texture
 - [x] raylib 6.0 dependency + X11 headers the nvrm-probe way (third_party/x11, `zig build fetch-x11`)
 - [x] Window (src/ui.zig): state, buffer fill, fps, video/audio bitrate, audio meter,
       bitrate graph, Save replay / Start-Stop recording buttons, last event
-- [x] Capture and audio on their own threads; UI + signals on the main thread; `--headless`
+- [x] Capture and audio on their own threads; UI on the main thread, signals on their own (2026-11-13: the
+      window loop stalls while minimised, which used to block save/record/quit); `--headless`
 - [ ] Buttons were only exercised through the equivalent `okorec save` / `okorec record`, not clicked
 - [ ] UI costs ~5% of a core on top of ~4% headless; look at raylib's frame wait / MSAA
 
@@ -62,7 +63,12 @@ Pipeline: portal ScreenCast (own D-Bus client) -> PipeWire stream -> GL texture
 - [x] Desktop audio via PipeWire sink monitor -> Opus 160 kb/s (libopus) -> MKV track 2
 - [x] Verified: 5.0 s recording = 300 video frames + 250 Opus packets, decodes cleanly
 - [ ] A/V sync not measured (audio is stamped by arrival time)
-- [ ] Optional microphone track; choice of output device / per-app audio
+- [x] Microphone track (2026-11-12): default input, mono Opus 64 kb/s VOIP -> MKV track 3 "Microphone";
+      Mic toggle in the window, remembered in ~/.config/okorec/okorec.conf (fps moved there too, migrated from ~/.local/state), `--mic on|off`; stream closed while off
+- [x] Verified: replay with mic on = 3 tracks, mic track has signal; mic off = no stream, 2 tracks;
+      recording with mic on = 3 tracks; all decode cleanly
+- [ ] Mic toggle clicked by a human in the window
+- [ ] Choice of output/input device; per-app audio; mixed track option
 
 ## Later / ideas
 - [ ] Handle resolution change mid-session (currently stops with an error)

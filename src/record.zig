@@ -14,6 +14,7 @@ pub const Recorder = struct {
     ring: *Ring,
     pipe: *Pipeline,
     audio: ?*Audio,
+    mic: ?*Audio = null,
 
     active: std.atomic.Value(bool) = .init(false),
     /// True from start until the file is finalised.
@@ -81,8 +82,18 @@ pub const Recorder = struct {
                 self.ring.unrefAll(pending.items[0..first]);
                 pending.replaceRangeAssumeCapacity(0, first, &.{});
                 if (pending.items.len > 0) {
-                    const head: ?[]const u8 = if (self.audio) |a| (if (a.ready.load(.acquire)) &a.head else null) else null;
-                    mux = try mkv.Muxer.begin(self.gpa, self.path().ptr, .{ .width = self.pipe.width, .height = self.pipe.height, .fps = self.pipe.fps.load(.monotonic) }, pending.items[0], head);
+                    // The mic track exists if the mic is on when the file starts.
+                    var tracks: [2]mkv.AudioTrack = undefined;
+                    var n: usize = 0;
+                    if (self.audio) |a| if (a.trackInfo()) |t| {
+                        tracks[n] = t;
+                        n += 1;
+                    };
+                    if (self.mic) |a| if (a.enabled.load(.acquire)) if (a.trackInfo()) |t| {
+                        tracks[n] = t;
+                        n += 1;
+                    };
+                    mux = try mkv.Muxer.begin(self.gpa, self.path().ptr, .{ .width = self.pipe.width, .height = self.pipe.height, .fps = self.pipe.fps.load(.monotonic) }, pending.items[0], tracks[0..n]);
                 }
             }
             if (mux) |*m| {

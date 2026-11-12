@@ -3,7 +3,8 @@
 A small GPU screen recorder for Linux with an instant-replay buffer
 (ShadowPlay style), written in Zig.
 
-OkoRec keeps the last N seconds of your screen and desktop audio in memory.
+OkoRec keeps the last N seconds of your screen, desktop audio and (optionally)
+your microphone in memory.
 Press a key and they are written to an MKV file; press another to record
 continuously until stopped. Frames stay on the GPU from scanout to encoder.
 
@@ -80,7 +81,14 @@ captures through xdg-desktop-portal like any other Wayland recorder.
     okorec probe           check the GPU encode path
     okorec --help          all options
 
-Clips go to `~/Videos/okorec`. Video is HEVC (constant quality), audio is Opus.
+Clips go to `~/Videos/okorec`. Video is HEVC (constant quality), audio is Opus:
+desktop audio and the microphone are separate tracks, so they can be balanced
+or dropped when editing. Switch the microphone with the **Mic** toggle in the
+window or `--mic on|off` for one run.
+
+The frame rate and microphone choices are kept in
+`~/.config/okorec/okorec.conf` (`fps = 120`, `mic = on`), which can also be
+edited by hand.
 
 ## Known limitations
 
@@ -89,7 +97,8 @@ The full, unvarnished list is in [LIMITATIONS.md](LIMITATIONS.md); plans are in
 
 - NVIDIA only; one monitor; the resolution must not change while running
 - HDR displays are tone-mapped to SDR by clipping (no HDR10 output)
-- Desktop audio only, no microphone track
+- Desktop audio and microphone are separate tracks, not mixed: many players
+  and sites (Discord, browsers) only play the first one, the desktop audio
 - Portal capture with `--zero-copy` is too dark in HDR mode on GNOME 48
 
 ## Third-party code

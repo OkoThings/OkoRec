@@ -79,6 +79,9 @@ fn Ebml(comptime cap: usize) type {
     };
 }
 
+/// An Opus track: which ring track feeds it, its OpusHead, a display name.
+pub const AudioTrack = struct { track: u8, head: []const u8, name: []const u8 };
+
 const Cue = struct { ts: u64, pos: u64 };
 /// Encoded size of one CuePoint as written by `finish`.
 const cue_size = 41;
@@ -95,8 +98,10 @@ pub const Muxer = struct {
     base_ns: i64 = 0,
     end_ts: u64 = 0,
     frame_ticks: u64,
-    /// Opus pre-skip, in ticks; audio block timestamps include it.
-    audio_delay_ticks: u64 = 0,
+    /// Opus pre-skip per ring track, in ticks; audio block timestamps include it.
+    audio_delay_ticks: [3]u64 = @splat(0),
+    /// Ring tracks declared in the header; packets of other tracks are skipped.
+    has_track: [3]bool = .{ true, false, false },
     cues: std.ArrayList(Cue) = .empty,
 
     fn write(self: *Muxer, data: []const u8) !void {
@@ -107,8 +112,8 @@ pub const Muxer = struct {
     pub const Video = struct { width: u32, height: u32, fps: u32 };
 
     /// `first_key` is the keyframe packet the file will start with (its
-    /// parameter sets go into the header). `opus_head` adds an audio track.
-    pub fn begin(gpa: std.mem.Allocator, path: [*:0]const u8, video: Video, first_key: *const Packet, opus_head: ?[]const u8) !Muxer {
+    /// parameter sets go into the header), followed by the audio tracks.
+    pub fn begin(gpa: std.mem.Allocator, path: [*:0]const u8, video: Video, first_key: *const Packet, audio_tracks: []const AudioTrack) !Muxer {
         const ps = hevc.ParamSets.find(first_key.data) orelse return error.NoParameterSets;
         var hv_buf: [1024]u8 = undefined;
         const hvcc = try hevc.buildHvcC(ps, &hv_buf);
@@ -164,15 +169,18 @@ pub const Muxer = struct {
         e.uint(0xBA, height);
         e.end(video_el);
         e.end(track);
-        if (opus_head) |oh| {
+        for (audio_tracks) |t| {
+            const oh = t.head;
             const preskip: u64 = std.mem.readInt(u16, oh[10..12], .little);
             const delay_ns = preskip * std.time.ns_per_s / 48000;
-            self.audio_delay_ticks = delay_ns / tick_ns;
+            self.audio_delay_ticks[t.track] = delay_ns / tick_ns;
+            self.has_track[t.track] = true;
             const at = e.begin(0xAE);
-            e.uint(0xD7, 2); // TrackNumber
-            e.uint(0x73C5, 2); // TrackUID
+            e.uint(0xD7, t.track + 1); // TrackNumber
+            e.uint(0x73C5, t.track + 1); // TrackUID
             e.uint(0x83, 2); // audio
             e.uint(0x9C, 0); // no lacing
+            e.str(0x536E, t.name); // Name
             e.str(0x86, "A_OPUS");
             e.str(0x63A2, oh); // CodecPrivate
             e.uint(0x56AA, delay_ns); // CodecDelay
@@ -191,7 +199,7 @@ pub const Muxer = struct {
 
     fn ticks(self: *const Muxer, p: *const Packet) u64 {
         const t: u64 = @intCast(@max(0, @divTrunc(p.pts_ns - self.base_ns, tick_ns)));
-        return if (p.track == 1) t + self.audio_delay_ticks else t;
+        return t + self.audio_delay_ticks[p.track];
     }
 
     /// Writes packets as one cluster per GOP. The slice must start with a
@@ -207,14 +215,19 @@ pub const Muxer = struct {
         try self.writeCluster(packets[start..]);
     }
 
+    fn wanted(self: *const Muxer, p: *const Packet) bool {
+        return self.has_track[p.track] and p.pts_ns >= self.base_ns;
+    }
+
     fn writeCluster(self: *Muxer, packets: []const *Packet) !void {
         if (packets.len == 0) return;
         const cluster_ts = self.ticks(packets[0]);
         var body: u64 = 0;
         // Audio captured just before the first keyframe has no place in the
-        // file (it would pile up at timestamp 0).
+        // file (it would pile up at timestamp 0), nor has a track the header
+        // doesn't declare (the mic switched on mid-recording).
         for (packets) |p| {
-            if (p.pts_ns >= self.base_ns) body += 1 + 8 + 4 + p.data.len;
+            if (self.wanted(p)) body += 1 + 8 + 4 + p.data.len;
         }
 
         var e = Ebml(64){};
@@ -227,7 +240,7 @@ pub const Muxer = struct {
         try self.write(e.bytes());
 
         for (packets) |p| {
-            if (p.pts_ns < self.base_ns) continue;
+            if (!self.wanted(p)) continue;
             const t = self.ticks(p);
             const diff = @as(i64, @intCast(t)) - @as(i64, @intCast(cluster_ts));
             const rel: i16 = @intCast(std.math.clamp(diff, std.math.minInt(i16), std.math.maxInt(i16)));
@@ -238,7 +251,7 @@ pub const Muxer = struct {
             var r: [2]u8 = undefined;
             std.mem.writeInt(i16, &r, rel, .big);
             b.raw(&r);
-            b.raw(&.{if (p.keyframe or p.track == 1) 0x80 else 0x00});
+            b.raw(&.{if (p.keyframe or p.track != 0) 0x80 else 0x00});
             try self.write(b.bytes());
             try self.write(p.data);
             if (p.track == 0) self.end_ts = @max(self.end_ts, t + self.frame_ticks);

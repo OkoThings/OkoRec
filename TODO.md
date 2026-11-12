@@ -26,7 +26,8 @@ problems these address. `tasks/plan.md` is the development log.
 
 ## Audio
 
-- [ ] Microphone as a second track
+- [ ] Optional mixed track (desktop + mic) for players that only play the first track
+- [ ] Add the mic track to a recording when the mic is switched on mid-recording
 - [ ] Keep OkoRec's own feedback sounds out of the capture
 - [ ] Follow default-device changes (test, then fix)
 

@@ -77,8 +77,17 @@ exactly one machine**: Debian 13, GNOME 48 on Wayland, one NVIDIA RTX 3080
 
 ## Audio
 
-- Desktop audio only (the default output's monitor). No microphone, no
-  per-application capture, no separate tracks.
+- Desktop audio is the default output's monitor; the microphone is the
+  default input. No device choice, no per-application capture.
+- The microphone is a **separate track, not mixed** into the desktop audio.
+  Players and sites that play only the first audio track (Discord, browsers,
+  many phone players) will not play it; mix it in an editor or with ffmpeg
+  (`-filter_complex amix`).
+- A recording only gets a microphone track if the mic is on when the file
+  starts. Switching it on mid-recording does not add it to that file;
+  switching it off mid-recording leaves silence (a gap) in the track.
+- The microphone is mono, 64 kb/s Opus in speech mode; no noise suppression,
+  gain control or push-to-talk.
 - **Audio/video sync has not been measured.** Audio is stamped with its
   arrival time, so a small constant offset is likely.
 - Behaviour when the default output device changes while running is untested.

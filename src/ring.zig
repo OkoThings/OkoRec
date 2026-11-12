@@ -9,7 +9,7 @@ pub const Packet = struct {
     /// CLOCK_MONOTONIC capture time.
     pts_ns: i64,
     keyframe: bool,
-    /// 0 = video, 1 = audio.
+    /// 0 = video, 1 = desktop audio, 2 = microphone.
     track: u8 = 0,
     /// Position in push order; lets a recording follow the ring.
     seq: u64 = 0,
@@ -27,7 +27,7 @@ pub const Ring = struct {
     bytes: usize = 0,
     next_seq: u64 = 1,
     /// Bytes ever pushed, per track (for bitrate display).
-    total_bytes: [2]u64 = .{ 0, 0 },
+    total_bytes: [3]u64 = @splat(0),
 
     pub fn init(gpa: std.mem.Allocator, seconds: u32) Ring {
         return .{ .gpa = gpa, .window_ns = @as(i64, seconds) * std.time.ns_per_s };
@@ -80,7 +80,7 @@ pub const Ring = struct {
         }
     }
 
-    pub const Stats = struct { bytes: usize, packets: usize, span_ns: i64, total_bytes: [2]u64 };
+    pub const Stats = struct { bytes: usize, packets: usize, span_ns: i64, total_bytes: [3]u64 };
 
     pub fn stats(self: *Ring) Stats {
         self.mutex.lock();
