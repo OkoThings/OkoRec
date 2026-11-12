@@ -4,7 +4,7 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc="GPU screen recorder with an instant-replay buffer (NVIDIA, KMS capture)"
 arch=('x86_64')
-url="https://github.com/OkoThings/okorec"
+url="https://github.com/OkoThings/OkoRec"
 license=('MIT')
 depends=('glibc' 'libpipewire' 'opus' 'libx11' 'libglvnd' 'libxrandr' 'libxinerama' 'libxcursor' 'libxi' 'nvidia-utils')
 makedepends=('git')
@@ -18,7 +18,7 @@ install=okorec.install
 # Built with the Zig release it was written for; it does not compile with
 # Zig 0.17 yet (see LIMITATIONS.md).
 _zig=zig-x86_64-linux-0.16.0
-source=("git+$url.git"
+source=("okorec::git+$url.git"
         "https://ziglang.org/download/0.16.0/$_zig.tar.xz")
 sha256sums=('SKIP'
             '70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00')

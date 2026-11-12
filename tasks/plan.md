@@ -82,7 +82,7 @@ Pipeline: portal ScreenCast (own D-Bus client) -> PipeWire stream -> GL texture
 - [x] Renamed zrec -> OkoRec (`okorec`, `okorec-kms`); installed files, shortcuts, state and clips folder migrated
 - [x] MIT LICENSE, local git repository
 - [x] AUR draft in packaging/aur (okorec-git, pins Zig 0.16.0 because Arch ships 0.17 and raylib 6.0's build script needs 0.16); build steps pass in an Arch container, makepkg itself not run
-- [x] GitHub: https://github.com/OkoThings/okorec (public; commits use the GitHub noreply address)
+- [x] GitHub: https://github.com/OkoThings/OkoRec (public; commits use the GitHub noreply address)
 - [x] raylib compiled from a vendored 58-file subset by our own build.zig; no dependency, no download at build time
 - [x] LIMITATIONS.md and TODO.md (public, deliberately exhaustive)
 - [x] GPU init retried after one intermittent EglMakeCurrentFailed at start
