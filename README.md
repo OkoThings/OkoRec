@@ -27,9 +27,9 @@ Zig 0.16 is required.
 
     zig build -Doptimize=ReleaseSafe
 
-The PipeWire and NVENC headers are vendored, so no `-dev` packages are needed
-for those. raylib (the window) is fetched by the Zig package manager and built
-from source; it needs the X11 and GL development headers:
+Nothing is downloaded at build time. The PipeWire and NVENC headers and the
+raylib sources used for the window are vendored. raylib needs the X11 and GL
+development headers:
 
     sudo apt install libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl-dev
 
@@ -83,6 +83,9 @@ captures through xdg-desktop-portal like any other Wayland recorder.
 Clips go to `~/Videos/okorec`. Video is HEVC (constant quality), audio is Opus.
 
 ## Known limitations
+
+The full, unvarnished list is in [LIMITATIONS.md](LIMITATIONS.md); plans are in
+[TODO.md](TODO.md). The main ones:
 
 - NVIDIA only; one monitor; the resolution must not change while running
 - HDR displays are tone-mapped to SDR by clipping (no HDR10 output)

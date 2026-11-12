@@ -46,32 +46,45 @@ pub fn build(b: *std.Build) void {
         mod.addObjectFile(.{ .cwd_relative = b.fmt("{s}/libopus.so.0", .{libdir}) });
     }
 
-    // Window: raylib, built from source. It needs X11/GL development files;
-    // without root, `zig build fetch-x11` unpacks the Debian -dev packages
-    // into third_party/x11.
+    // Window: raylib 6.0, compiled here from the subset of its sources kept in
+    // vendor/raylib (GLFW on X11, no audio, no models). It needs the X11/GL
+    // development files; without root, `zig build fetch-x11` unpacks the
+    // Debian -dev packages into third_party/x11.
     const x11 = "third_party/x11";
     const fetch_x11 = b.step("fetch-x11", "Download X11/GL headers for raylib into " ++ x11 ++ " (no root needed)");
     fetch_x11.dependOn(&b.addSystemCommand(&.{ "sh", "tools/fetch_x11_dev.sh", x11 }).step);
-    const raylib_dep = b.dependency("raylib", .{
-        .target = target,
-        .optimize = optimize,
-        .linux_display_backend = .X11,
-        .raudio = false,
-    });
-    const raylib = raylib_dep.artifact("raylib");
     const has_local_x11 = if (std.Io.Dir.cwd().access(b.graph.io, b.pathFromRoot(x11), .{})) true else |_| false;
     if (has_local_x11) {
-        raylib.root_module.addIncludePath(b.path(x11 ++ "/root/usr/include"));
-        raylib.root_module.addLibraryPath(b.path(x11 ++ "/lib"));
+        mod.addIncludePath(b.path(x11 ++ "/root/usr/include"));
         mod.addLibraryPath(b.path(x11 ++ "/lib"));
     }
+    const raylib_src = "vendor/raylib/src";
+    mod.addIncludePath(b.path(raylib_src));
+    mod.addIncludePath(b.path(raylib_src ++ "/platforms"));
+    mod.addIncludePath(b.path(raylib_src ++ "/external/glfw/include"));
+    mod.addCSourceFiles(.{
+        .root = b.path(raylib_src),
+        .files = &.{ "rcore.c", "rshapes.c", "rtextures.c", "rtext.c", "rglfw.c" },
+        .flags = &.{
+            "-std=c99",
+            "-fno-sanitize=undefined",
+            "-DPLATFORM_DESKTOP_GLFW",
+            "-D_GLFW_X11",
+            "-DGRAPHICS_API_OPENGL_33",
+            "-DSUPPORT_MODULE_RSHAPES=1",
+            "-DSUPPORT_MODULE_RTEXTURES=1",
+            "-DSUPPORT_MODULE_RTEXT=1",
+            "-DSUPPORT_MODULE_RMODELS=0",
+            "-DSUPPORT_MODULE_RAUDIO=0",
+        },
+    });
+    for ([_][]const u8{ "GL", "X11", "Xrandr", "Xinerama", "Xi", "Xcursor" }) |lib| mod.linkSystemLibrary(lib, .{});
     const raylib_h = b.addTranslateC(.{
-        .root_source_file = raylib_dep.path("src/raylib.h"),
+        .root_source_file = b.path(raylib_src ++ "/raylib.h"),
         .target = target,
         .optimize = optimize,
     });
     mod.addImport("raylib", raylib_h.createModule());
-    mod.linkLibrary(raylib);
 
     const exe = b.addExecutable(.{ .name = "okorec", .root_module = mod });
     b.installArtifact(exe);

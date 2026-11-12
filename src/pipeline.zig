@@ -41,7 +41,18 @@ pub const Pipeline = struct {
 
     /// Creates the GL and CUDA contexts on the calling thread.
     pub fn init(self: *Pipeline) !void {
-        self.gpu = try egl.Gpu.init();
+        // Seen once in ~20 starts: eglMakeCurrent fails while the window's own
+        // GL context is being created on the main thread. Try again shortly.
+        var attempt: u32 = 0;
+        self.gpu = while (true) : (attempt += 1) {
+            break egl.Gpu.init() catch |e| {
+                if (attempt >= 4) return e;
+                util.log("gpu: {s}, retrying\n", .{@errorName(e)});
+                const ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 150 * std.time.ns_per_ms };
+                _ = std.os.linux.nanosleep(&ts, null);
+                continue;
+            };
+        };
         self.cuda = try cuda_mod.Cuda.init();
         self.source = self.gpu.createSource();
     }

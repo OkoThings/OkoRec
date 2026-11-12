@@ -3,11 +3,6 @@
     .version = "0.1.0",
     .fingerprint = 0x5e83ae1b92cdfe06,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{
-        .raylib = .{
-            .url = "https://github.com/raysan5/raylib/archive/refs/tags/6.0.tar.gz",
-            .hash = "raylib-6.0.0-whq8uCSwLgWWeF3ec3dbG6Rr36SLFL-s2WJ1Q_2E22Bb",
-        },
-    },
-    .paths = .{ "build.zig", "build.zig.zon", "src", "tools", "vendor", "data", "packaging", "README.md", "THIRD_PARTY.md", "LICENSE" },
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tools", "vendor", "data", "packaging", "README.md", "LIMITATIONS.md", "TODO.md", "THIRD_PARTY.md", "LICENSE" },
 }

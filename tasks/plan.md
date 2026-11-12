@@ -82,8 +82,12 @@ Pipeline: portal ScreenCast (own D-Bus client) -> PipeWire stream -> GL texture
 - [x] Renamed zrec -> OkoRec (`okorec`, `okorec-kms`); installed files, shortcuts, state and clips folder migrated
 - [x] MIT LICENSE, local git repository
 - [x] AUR draft in packaging/aur (okorec-git, pins Zig 0.16.0 because Arch ships 0.17 and raylib 6.0's build script needs 0.16); build steps pass in an Arch container, makepkg itself not run
-- [ ] GitHub organisation OkoThings (web UI only), push, then publish the AUR package
-- [ ] Port to Zig 0.17 (needs a raylib whose build.zig supports it)
+- [x] GitHub: https://github.com/OkoThings/okorec (public; commits use the GitHub noreply address)
+- [x] raylib compiled from a vendored 58-file subset by our own build.zig; no dependency, no download at build time
+- [x] LIMITATIONS.md and TODO.md (public, deliberately exhaustive)
+- [x] GPU init retried after one intermittent EglMakeCurrentFailed at start
+- [ ] Publish the AUR package (needs the owner's AUR account and SSH key)
+- [ ] Port to Zig 0.17: first errors are `@cImport` removed, `@typeInfo` struct field layout, `std.fmt.bufPrintZ` gone, build API (`pathFromRoot`, `b.args`); more will follow
 - [ ] RUNPATH pointing at third_party/x11/lib when built with `fetch-x11` (build with system -dev packages for release binaries)
 - [ ] Build against a system raylib (`-fsys=raylib`) for distros that forbid network fetches / bundled sources
 - [ ] Try a build on Arch and Fedora (container), and on a second NVIDIA machine
